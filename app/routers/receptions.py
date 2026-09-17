@@ -1,0 +1,1236 @@
+import hashlib
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.config import settings
+from app.database import engine
+from app.schemas import (
+    ReceptionCreate,
+    ReceptionCreateResponse,
+    ReceptionNoteCreate,
+    ReceptionStatusUpdate,
+)
+from app.security import CurrentUser, require_staff
+
+
+router = APIRouter(prefix="/receptions", tags=["receptions"])
+
+
+def _owner_id(connection):
+    owner_id = connection.execute(
+        text(
+            """
+            SELECT id
+            FROM core.app_users
+            WHERE username = :username
+              AND is_active = TRUE
+            LIMIT 1
+            """
+        ),
+        {"username": settings.owner_username},
+    ).scalar_one_or_none()
+
+    if owner_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Brak aktywnego użytkownika OWNER: {settings.owner_username}",
+        )
+    return owner_id
+
+
+def _parse_uuid(value: str, label: str = "ID"):
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Nieprawidłowe {label}.") from exc
+
+
+def _iso(value):
+    return value.isoformat() if value else None
+
+
+def _phone_upsert(connection, raw_number: str):
+    return connection.execute(
+        text(
+            """
+            INSERT INTO core.phone_numbers (
+                e164,
+                display_number,
+                first_seen_at,
+                last_seen_at,
+                source
+            )
+            VALUES (
+                core.normalize_phone(:phone),
+                :phone,
+                now(),
+                now(),
+                'ANDROID_RECEPTION'
+            )
+            ON CONFLICT (e164)
+            DO UPDATE SET
+                display_number = EXCLUDED.display_number,
+                last_seen_at = now()
+            RETURNING id, e164, match_key
+            """
+        ),
+        {"phone": raw_number},
+    ).mappings().one()
+
+
+def _client_for_phone(connection, match_key: str):
+    return connection.execute(
+        text(
+            """
+            SELECT c.id, c.display_name
+            FROM core.clients c
+            JOIN core.client_phones cp ON cp.client_id = c.id
+            JOIN core.phone_numbers p ON p.id = cp.phone_number_id
+            WHERE p.match_key = :match_key
+              AND c.is_active = TRUE
+            ORDER BY c.created_at ASC
+            LIMIT 1
+            """
+        ),
+        {"match_key": match_key},
+    ).mappings().first()
+
+
+def _device_for_reception(
+    connection,
+    client_id,
+    reception: ReceptionCreate,
+    owner_id,
+):
+    serial = reception.serial_number.strip()
+    serial_normalized = "".join(ch for ch in serial.upper() if ch.isalnum())
+
+    if serial_normalized:
+        existing = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM core.devices
+                WHERE client_id = :client_id
+                  AND serial_normalized = :serial_normalized
+                  AND archived_at IS NULL
+                ORDER BY created_at ASC
+                LIMIT 1
+                """
+            ),
+            {
+                "client_id": client_id,
+                "serial_normalized": serial_normalized,
+            },
+        ).scalar_one_or_none()
+
+        if existing is not None:
+            connection.execute(
+                text(
+                    """
+                    UPDATE core.devices
+                    SET
+                        device_type = COALESCE(NULLIF(btrim(:device_type), ''), device_type),
+                        model = COALESCE(NULLIF(btrim(:model), ''), model),
+                        serial_number = COALESCE(NULLIF(btrim(:serial_number), ''), serial_number),
+                        description = COALESCE(NULLIF(btrim(:description), ''), description),
+                        updated_by = :owner_id
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": existing,
+                    "device_type": reception.device_type,
+                    "model": reception.device_brand_model,
+                    "serial_number": reception.serial_number,
+                    "description": reception.issue_description,
+                    "owner_id": owner_id,
+                },
+            )
+            return existing
+
+    return connection.execute(
+        text(
+            """
+            INSERT INTO core.devices (
+                client_id,
+                device_type,
+                model,
+                serial_number,
+                serial_normalized,
+                description,
+                created_by
+            )
+            VALUES (
+                :client_id,
+                :device_type,
+                NULLIF(btrim(:model), ''),
+                NULLIF(btrim(:serial_number), ''),
+                NULLIF(:serial_normalized, ''),
+                NULLIF(btrim(:description), ''),
+                :owner_id
+            )
+            RETURNING id
+            """
+        ),
+        {
+            "client_id": client_id,
+            "device_type": reception.device_type.strip(),
+            "model": reception.device_brand_model.strip(),
+            "serial_number": reception.serial_number,
+            "serial_normalized": serial_normalized,
+            "description": reception.issue_description,
+            "owner_id": owner_id,
+        },
+    ).scalar_one()
+
+
+def _reception_row(row):
+    return {
+        "id": str(row["id"]),
+        "reception_number": row["reception_number"],
+        "status": str(row["status"]),
+        "received_at": _iso(row["received_at"]),
+        "received_by": str(row["received_by"]) if row["received_by"] else "",
+        "received_by_name": row["received_by_name"] or "",
+        "ready_at": _iso(row["ready_at"]),
+        "client_notified_at": _iso(row["client_notified_at"]),
+        "completed_at": _iso(row["completed_at"]),
+        "cancelled_at": _iso(row["cancelled_at"]),
+        "cancellation_reason": row["cancellation_reason"] or "",
+        "is_warranty_repair": bool(row["is_warranty_repair"]),
+        "warranty_parent_order_id": (
+            str(row["warranty_parent_order_id"])
+            if row["warranty_parent_order_id"]
+            else None
+        ),
+        "client_name": row["client_name"] or "",
+        "phone_number1": row["phone_number1"] or "",
+        "phone_number2": row["phone_number2"] or "",
+        "device_type": row["device_type"] or "",
+        "device_brand_model": row["device_brand_model"] or "",
+        "serial_number": row["serial_number"] or "",
+        "issue_description": row["issue_description"] or "",
+        "service_amount": float(row["service_amount"] or 0),
+        "media_count": int(row["media_count"] or 0),
+    }
+
+
+_RECEPTION_SELECT = """
+    SELECT
+        so.id,
+        so.reception_number,
+        so.status,
+        so.received_at,
+        so.received_by,
+        ru.display_name AS received_by_name,
+        so.ready_at,
+        so.client_notified_at,
+        so.completed_at,
+        so.cancelled_at,
+        so.cancellation_reason,
+        so.is_warranty_repair,
+        so.warranty_parent_order_id,
+        c.display_name AS client_name,
+        p1.display_number AS phone_number1,
+        p2.display_number AS phone_number2,
+        d.device_type,
+        d.model AS device_brand_model,
+        d.serial_number,
+        COALESCE(so.fault_description, so.intake_description, '') AS issue_description,
+        COALESCE(
+            (
+                SELECT ofi.service_amount
+                FROM service.owner_finances ofi
+                WHERE ofi.service_order_id = so.id
+                LIMIT 1
+            ),
+            0
+        ) AS service_amount,
+        (
+            SELECT COUNT(*)
+            FROM service.service_order_media som
+            WHERE som.service_order_id = so.id
+              AND som.deleted_at IS NULL
+        ) AS media_count
+    FROM service.service_orders so
+    LEFT JOIN core.clients c ON c.id = so.client_id
+    LEFT JOIN core.phone_numbers p1 ON p1.id = so.primary_phone_id
+    LEFT JOIN core.phone_numbers p2 ON p2.id = so.secondary_phone_id
+    LEFT JOIN core.devices d ON d.id = so.device_id
+    LEFT JOIN core.app_users ru ON ru.id = so.received_by
+"""
+
+
+@router.get("")
+def get_receptions(
+    scope: str = Query(default="active", pattern="^(active|completed|cancelled|all)$"),
+    search: str = Query(default="", max_length=200),
+    user: CurrentUser = Depends(require_staff),
+):
+    conditions = []
+    params = {}
+
+    if scope == "active":
+        conditions.append("so.status IN ('IN_SERVICE', 'READY_FOR_PICKUP')")
+    elif scope == "completed":
+        conditions.append("so.status = 'COMPLETED'")
+    elif scope == "cancelled":
+        conditions.append("so.status = 'CANCELLED'")
+
+    if search.strip():
+        params["search"] = f"%{search.strip()}%"
+        conditions.append(
+            """
+            (
+                so.reception_number ILIKE :search OR
+                COALESCE(c.display_name, '') ILIKE :search OR
+                COALESCE(p1.display_number, '') ILIKE :search OR
+                COALESCE(p2.display_number, '') ILIKE :search OR
+                COALESCE(d.device_type, '') ILIKE :search OR
+                COALESCE(d.model, '') ILIKE :search OR
+                COALESCE(d.serial_number, '') ILIKE :search
+            )
+            """
+        )
+
+    where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = _RECEPTION_SELECT + where_sql + " ORDER BY so.received_at DESC"
+
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(text(query), params).mappings().all()
+        return [_reception_row(row) for row in rows]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd pobierania przyjęć: {exc}") from exc
+
+
+@router.get("/{reception_id}")
+def get_reception(reception_id: str, user: CurrentUser = Depends(require_staff)):
+    reception_uuid = _parse_uuid(reception_id, "ID przyjęcia")
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(_RECEPTION_SELECT + " WHERE so.id = :id"),
+                {"id": reception_uuid},
+            ).mappings().first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Nie znaleziono przyjęcia.")
+        return _reception_row(row)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd pobierania przyjęcia: {exc}") from exc
+
+
+@router.post("", response_model=ReceptionCreateResponse)
+def create_reception(reception: ReceptionCreate, user: CurrentUser = Depends(require_staff)):
+    try:
+        with engine.begin() as connection:
+            owner_id = uuid.UUID(user.id)
+            primary_phone = _phone_upsert(connection, reception.phone_number1)
+            primary_phone_id = primary_phone["id"]
+
+            client = _client_for_phone(connection, primary_phone["match_key"])
+            if client is None:
+                client_id = connection.execute(
+                    text(
+                        """
+                        INSERT INTO core.clients (display_name, created_by)
+                        VALUES (NULLIF(btrim(:client_name), ''), :owner_id)
+                        RETURNING id
+                        """
+                    ),
+                    {
+                        "client_name": reception.client_name,
+                        "owner_id": owner_id,
+                    },
+                ).scalar_one()
+
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO core.client_phones (
+                            client_id, phone_number_id, label, is_primary
+                        )
+                        VALUES (:client_id, :phone_id, 'Telefon 1', TRUE)
+                        ON CONFLICT (client_id, phone_number_id) DO NOTHING
+                        """
+                    ),
+                    {"client_id": client_id, "phone_id": primary_phone_id},
+                )
+            else:
+                client_id = client["id"]
+                if reception.client_name.strip():
+                    connection.execute(
+                        text(
+                            """
+                            UPDATE core.clients
+                            SET
+                                display_name = CASE
+                                    WHEN display_name IS NULL OR btrim(display_name) = ''
+                                    THEN :client_name
+                                    ELSE display_name
+                                END,
+                                updated_by = :owner_id
+                            WHERE id = :client_id
+                            """
+                        ),
+                        {
+                            "client_id": client_id,
+                            "client_name": reception.client_name.strip(),
+                            "owner_id": owner_id,
+                        },
+                    )
+
+            secondary_phone_id = None
+            if reception.phone_number2.strip():
+                secondary_phone = _phone_upsert(connection, reception.phone_number2)
+                secondary_phone_id = secondary_phone["id"]
+                if secondary_phone_id != primary_phone_id:
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO core.client_phones (
+                                client_id, phone_number_id, label, is_primary
+                            )
+                            VALUES (:client_id, :phone_id, 'Telefon 2', FALSE)
+                            ON CONFLICT (client_id, phone_number_id) DO NOTHING
+                            """
+                        ),
+                        {"client_id": client_id, "phone_id": secondary_phone_id},
+                    )
+                else:
+                    secondary_phone_id = None
+
+            device_id = _device_for_reception(connection, client_id, reception, owner_id)
+
+            order = connection.execute(
+                text(
+                    """
+                    INSERT INTO service.service_orders (
+                        reception_number,
+                        client_id,
+                        primary_phone_id,
+                        secondary_phone_id,
+                        device_id,
+                        status,
+                        intake_description,
+                        fault_description,
+                        is_warranty_repair,
+                        received_by,
+                        updated_by
+                    )
+                    VALUES (
+                        '',
+                        :client_id,
+                        :primary_phone_id,
+                        :secondary_phone_id,
+                        :device_id,
+                        'IN_SERVICE',
+                        NULLIF(btrim(:issue_description), ''),
+                        NULLIF(btrim(:issue_description), ''),
+                        :is_warranty_repair,
+                        :owner_id,
+                        :owner_id
+                    )
+                    RETURNING id, reception_number, status
+                    """
+                ),
+                {
+                    "client_id": client_id,
+                    "primary_phone_id": primary_phone_id,
+                    "secondary_phone_id": secondary_phone_id,
+                    "device_id": device_id,
+                    "issue_description": reception.issue_description,
+                    "is_warranty_repair": reception.is_warranty_repair,
+                    "owner_id": owner_id,
+                },
+            ).mappings().one()
+
+            return ReceptionCreateResponse(
+                id=str(order["id"]),
+                reception_number=order["reception_number"],
+                status=str(order["status"]),
+                client_id=str(client_id),
+                device_id=str(device_id),
+            )
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd bazy danych: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/{reception_id}/status")
+def update_reception_status(
+    reception_id: str,
+    body: ReceptionStatusUpdate,
+    user: CurrentUser = Depends(require_staff),
+):
+    reception_uuid = _parse_uuid(reception_id, "ID przyjęcia")
+    reason = body.cancellation_reason.strip()
+
+    if body.status == "CANCELLED" and not reason:
+        raise HTTPException(status_code=400, detail="Powód anulowania jest wymagany.")
+
+    try:
+        with engine.begin() as connection:
+            owner_id = uuid.UUID(user.id)
+
+            current = connection.execute(
+                text(
+                    """
+                    SELECT status
+                    FROM service.service_orders
+                    WHERE id = :id
+                    """
+                ),
+                {"id": reception_uuid},
+            ).mappings().first()
+
+            if current is None:
+                raise HTTPException(status_code=404, detail="Nie znaleziono przyjęcia.")
+
+            current_status = str(current["status"])
+
+            if user.role == "RECEPTION":
+                allowed_release = (
+                    current_status == "READY_FOR_PICKUP"
+                    and body.status == "COMPLETED"
+                )
+
+                if not allowed_release:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            "Recepcja może zakończyć wyłącznie zlecenie "
+                            "ze statusem GOTOWY DO ODBIORU."
+                        ),
+                    )
+
+            row = connection.execute(
+                text(
+                    """
+                    UPDATE service.service_orders
+                    SET
+                        status = CAST(:status AS service.reception_status),
+                        cancellation_reason = CASE
+                            WHEN :status = 'CANCELLED' THEN :reason
+                            ELSE cancellation_reason
+                        END,
+                        cancelled_by = CASE
+                            WHEN :status = 'CANCELLED' THEN :owner_id
+                            ELSE cancelled_by
+                        END,
+                        updated_by = :owner_id
+                    WHERE id = :id
+                    RETURNING id, reception_number, status, ready_at,
+                              completed_at, cancelled_at, cancellation_reason,
+                              is_warranty_repair
+                    """
+                ),
+                {
+                    "id": reception_uuid,
+                    "status": body.status,
+                    "reason": reason or None,
+                    "owner_id": owner_id,
+                },
+            ).mappings().first()
+
+        return {
+            "id": str(row["id"]),
+            "reception_number": row["reception_number"],
+            "status": str(row["status"]),
+            "ready_at": _iso(row["ready_at"]),
+            "completed_at": _iso(row["completed_at"]),
+            "cancelled_at": _iso(row["cancelled_at"]),
+            "cancellation_reason": row["cancellation_reason"] or "",
+            "is_warranty_repair": bool(row["is_warranty_repair"]),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd zmiany statusu: {exc}") from exc
+
+
+@router.post("/{reception_id}/notify-client")
+def mark_client_notified(reception_id: str, user: CurrentUser = Depends(require_staff)):
+    if user.role == "RECEPTION":
+        raise HTTPException(
+            status_code=403,
+            detail="Recepcja nie może oznaczać kontaktu serwisowego z klientem.",
+        )
+    reception_uuid = _parse_uuid(reception_id, "ID przyjęcia")
+    try:
+        with engine.begin() as connection:
+            owner_id = uuid.UUID(user.id)
+            row = connection.execute(
+                text(
+                    """
+                    UPDATE service.service_orders
+                    SET client_notified_at = now(), updated_by = :owner_id
+                    WHERE id = :id
+                    RETURNING id, reception_number, client_notified_at
+                    """
+                ),
+                {"id": reception_uuid, "owner_id": owner_id},
+            ).mappings().first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Nie znaleziono przyjęcia.")
+        return {
+            "id": str(row["id"]),
+            "reception_number": row["reception_number"],
+            "client_notified_at": _iso(row["client_notified_at"]),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd zapisu informacji: {exc}") from exc
+
+
+@router.get("/{reception_id}/notes")
+def get_notes(reception_id: str, user: CurrentUser = Depends(require_staff)):
+    reception_uuid = _parse_uuid(reception_id, "ID przyjęcia")
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT n.id, n.note_text, n.visibility, n.created_at,
+                           u.display_name AS created_by
+                    FROM service.service_order_notes n
+                    LEFT JOIN core.app_users u ON u.id = n.created_by
+                    WHERE n.service_order_id = :id
+                      AND n.deleted_at IS NULL
+                      AND (:can_owner OR n.visibility = 'STAFF')
+                    ORDER BY n.created_at DESC
+                    """
+                ),
+                {"id": reception_uuid, "can_owner": user.role in ("OWNER", "ADMIN")},
+            ).mappings().all()
+        return [
+            {
+                "id": str(row["id"]),
+                "text": row["note_text"],
+                "visibility": str(row["visibility"]),
+                "created_at": _iso(row["created_at"]),
+                "created_by": row["created_by"] or "",
+            }
+            for row in rows
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd pobierania notatek: {exc}") from exc
+
+
+@router.post("/{reception_id}/notes")
+def add_note(
+    reception_id: str,
+    body: ReceptionNoteCreate,
+    user: CurrentUser = Depends(require_staff),
+):
+    if body.visibility == "OWNER_ONLY" and user.role not in ("OWNER", "ADMIN"):
+        raise HTTPException(
+            status_code=403,
+            detail="Brak dostępu do prywatnych notatek właściciela.",
+        )
+    reception_uuid = _parse_uuid(reception_id, "ID przyjęcia")
+    try:
+        with engine.begin() as connection:
+            owner_id = uuid.UUID(user.id)
+            exists = connection.execute(
+                text("SELECT 1 FROM service.service_orders WHERE id = :id"),
+                {"id": reception_uuid},
+            ).scalar_one_or_none()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Nie znaleziono przyjęcia.")
+
+            row = connection.execute(
+                text(
+                    """
+                    INSERT INTO service.service_order_notes (
+                        service_order_id, note_text, visibility, created_by
+                    )
+                    VALUES (
+                        :id, :text, CAST(:visibility AS service.note_visibility), :owner_id
+                    )
+                    RETURNING id, note_text, visibility, created_at
+                    """
+                ),
+                {
+                    "id": reception_uuid,
+                    "text": body.text.strip(),
+                    "visibility": body.visibility,
+                    "owner_id": owner_id,
+                },
+            ).mappings().one()
+        return {
+            "id": str(row["id"]),
+            "text": row["note_text"],
+            "visibility": str(row["visibility"]),
+            "created_at": _iso(row["created_at"]),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd zapisu notatki: {exc}") from exc
+
+
+@router.get("/{reception_id}/media")
+def list_reception_media(reception_id: str, user: CurrentUser = Depends(require_staff)):
+    reception_uuid = _parse_uuid(reception_id, "ID przyjęcia")
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT
+                        som.id,
+                        som.media_kind,
+                        som.sort_order,
+                        som.caption,
+                        som.created_at,
+                        so.original_filename,
+                        so.mime_type,
+                        so.size_bytes,
+                        so.object_key
+                    FROM service.service_order_media som
+                    JOIN core.storage_objects so ON so.id = som.storage_object_id
+                    WHERE som.service_order_id = :id
+                      AND som.deleted_at IS NULL
+                      AND so.deleted_at IS NULL
+                    ORDER BY som.media_kind, som.sort_order, som.created_at
+                    """
+                ),
+                {"id": reception_uuid},
+            ).mappings().all()
+        return [
+            {
+                "id": str(row["id"]),
+                "media_kind": str(row["media_kind"]),
+                "sort_order": row["sort_order"],
+                "caption": row["caption"] or "",
+                "created_at": _iso(row["created_at"]),
+                "original_filename": row["original_filename"] or "",
+                "mime_type": row["mime_type"] or "application/octet-stream",
+                "size_bytes": row["size_bytes"] or 0,
+                "content_url": f"/receptions/media/{row['id']}/content",
+            }
+            for row in rows
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd pobierania zdjęć: {exc}") from exc
+
+
+@router.get("/media/{media_id}/content")
+def get_media_content(media_id: str, user: CurrentUser = Depends(require_staff)):
+    media_uuid = _parse_uuid(media_id, "ID pliku")
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT so.object_key, so.original_filename, so.mime_type
+                    FROM service.service_order_media som
+                    JOIN core.storage_objects so ON so.id = som.storage_object_id
+                    WHERE som.id = :id
+                      AND som.deleted_at IS NULL
+                      AND so.deleted_at IS NULL
+                    """
+                ),
+                {"id": media_uuid},
+            ).mappings().first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Nie znaleziono pliku.")
+
+        media_root = Path(settings.media_root).resolve()
+        path = (media_root / row["object_key"]).resolve()
+        try:
+            path.relative_to(media_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail="Nieprawidłowa ścieżka pliku.") from exc
+
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Plik nie istnieje na dysku.")
+
+        return FileResponse(
+            path=path,
+            media_type=row["mime_type"] or "application/octet-stream",
+            filename=row["original_filename"] or path.name,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Błąd odczytu pliku: {exc}") from exc
+
+
+@router.post("/{reception_id}/media")
+def upload_reception_media(
+    reception_id: str,
+    media_kind: str = Form(...),
+    sort_order: int = Form(0),
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(require_staff),
+):
+    allowed_kinds = {
+        "DEVICE_LABEL",
+        "INTAKE_PHOTO",
+        "REPAIR_PHOTO",
+        "RELEASE_PHOTO",
+        "DOCUMENT",
+        "OTHER",
+    }
+    if media_kind not in allowed_kinds:
+        raise HTTPException(status_code=400, detail="Nieprawidłowy typ pliku.")
+
+    reception_uuid = _parse_uuid(reception_id, "ID przyjęcia")
+    media_root = Path(settings.media_root).resolve()
+    reception_directory = media_root / "receptions" / str(reception_uuid)
+    reception_directory.mkdir(parents=True, exist_ok=True)
+
+    original_filename = file.filename or "photo.jpg"
+    suffix = Path(original_filename).suffix.lower() or ".jpg"
+    generated_filename = f"{uuid.uuid4()}{suffix}"
+    final_path = reception_directory / generated_filename
+
+    sha256 = hashlib.sha256()
+    size_bytes = 0
+
+    try:
+        with final_path.open("wb") as output_file:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                output_file.write(chunk)
+                sha256.update(chunk)
+                size_bytes += len(chunk)
+
+        if size_bytes == 0:
+            raise HTTPException(status_code=400, detail="Przesłany plik jest pusty.")
+
+        object_key = str(final_path.relative_to(media_root)).replace("\\", "/")
+        mime_type = file.content_type or "application/octet-stream"
+
+        with engine.begin() as connection:
+            exists = connection.execute(
+                text("SELECT 1 FROM service.service_orders WHERE id = :id"),
+                {"id": reception_uuid},
+            ).scalar_one_or_none()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Nie znaleziono przyjęcia.")
+
+            owner_id = uuid.UUID(user.id)
+            storage_object = connection.execute(
+                text(
+                    """
+                    INSERT INTO core.storage_objects (
+                        storage_area, object_key, original_filename, mime_type,
+                        extension, size_bytes, sha256, uploaded_at,
+                        upload_completed, created_by
+                    )
+                    VALUES (
+                        'media', :object_key, :original_filename, :mime_type,
+                        :extension, :size_bytes, :sha256, now(), TRUE, :owner_id
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "object_key": object_key,
+                    "original_filename": original_filename,
+                    "mime_type": mime_type,
+                    "extension": suffix,
+                    "size_bytes": size_bytes,
+                    "sha256": sha256.hexdigest(),
+                    "owner_id": owner_id,
+                },
+            ).mappings().one()
+
+            media = connection.execute(
+                text(
+                    """
+                    INSERT INTO service.service_order_media (
+                        service_order_id, storage_object_id, media_kind,
+                        sort_order, is_source_of_truth, created_by
+                    )
+                    VALUES (
+                        :service_order_id,
+                        :storage_object_id,
+                        CAST(:media_kind AS service.media_kind),
+                        :sort_order,
+                        :is_source_of_truth,
+                        :owner_id
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "service_order_id": reception_uuid,
+                    "storage_object_id": storage_object["id"],
+                    "media_kind": media_kind,
+                    "sort_order": sort_order,
+                    "is_source_of_truth": media_kind == "DEVICE_LABEL",
+                    "owner_id": owner_id,
+                },
+            ).mappings().one()
+
+        return {
+            "status": "ok",
+            "media_id": str(media["id"]),
+            "storage_object_id": str(storage_object["id"]),
+            "media_kind": media_kind,
+            "object_key": object_key,
+            "size_bytes": size_bytes,
+            "sha256": sha256.hexdigest(),
+        }
+
+    except HTTPException:
+        if final_path.exists():
+            final_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        if final_path.exists():
+            final_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Błąd zapisu zdjęcia: {exc}") from exc
+    finally:
+        file.file.close()
+
+
+from pydantic import BaseModel
+
+
+class ReceptionEdit(BaseModel):
+    device_type: str = ""
+    device_brand_model: str = ""
+    serial_number: str = ""
+    issue_description: str = ""
+    phone_number1: str = ""
+    phone_number2: str = ""
+    client_name: str = ""
+
+
+class OcrResultBody(BaseModel):
+    media_id: str
+    raw_text: str = ""
+    detected_manufacturer: str = ""
+    detected_model: str = ""
+    detected_serial_number: str = ""
+    success: bool = True
+    error_message: str = ""
+    engine_name: str = "ML_KIT_TEXT_RECOGNITION"
+    engine_version: str = ""
+    parser_version: str = "1"
+
+
+@router.patch("/{reception_id}")
+def edit_reception(
+    reception_id: str,
+    body: ReceptionEdit,
+    user: CurrentUser = Depends(require_staff),
+):
+    rid = _parse_uuid(reception_id, "ID przyjęcia")
+    with engine.begin() as con:
+        row = con.execute(
+            text(
+                """
+                SELECT
+                    client_id,
+                    device_id,
+                    primary_phone_id,
+                    secondary_phone_id,
+                    status
+                FROM service.service_orders
+                WHERE id = :id
+                """
+            ),
+            {"id": rid},
+        ).mappings().first()
+
+        if not row:
+            raise HTTPException(404, "Nie znaleziono przyjęcia.")
+
+        if user.role == "RECEPTION" and str(row["status"]) != "IN_SERVICE":
+            raise HTTPException(
+                403,
+                "Po zmianie etapu przyjęcie nie może być swobodnie edytowane przez recepcję.",
+            )
+
+        actor = uuid.UUID(user.id)
+
+        if body.client_name.strip():
+            con.execute(
+                text(
+                    """
+                    UPDATE core.clients
+                    SET display_name = :n,
+                        updated_by = :u
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "n": body.client_name.strip(),
+                    "u": actor,
+                    "id": row["client_id"],
+                },
+            )
+
+        p1 = row["primary_phone_id"]
+
+        if body.phone_number1.strip():
+            p1 = _phone_upsert(con, body.phone_number1)["id"]
+
+        p2 = None
+
+        if body.phone_number2.strip():
+            p2 = _phone_upsert(con, body.phone_number2)["id"]
+            if p2 == p1:
+                p2 = None
+
+        con.execute(
+            text(
+                """
+                UPDATE core.devices
+                SET
+                    device_type = NULLIF(btrim(:t), ''),
+                    model = NULLIF(btrim(:m), ''),
+                    serial_number = NULLIF(btrim(:s), ''),
+                    serial_normalized = NULLIF(
+                        upper(
+                            regexp_replace(
+                                btrim(:s),
+                                '[^A-Za-z0-9]',
+                                '',
+                                'g'
+                            )
+                        ),
+                        ''
+                    ),
+                    description = NULLIF(btrim(:d), ''),
+                    updated_by = :u
+                WHERE id = :id
+                """
+            ),
+            {
+                "t": body.device_type,
+                "m": body.device_brand_model,
+                "s": body.serial_number,
+                "d": body.issue_description,
+                "u": actor,
+                "id": row["device_id"],
+            },
+        )
+
+        con.execute(
+            text(
+                """
+                UPDATE service.service_orders
+                SET
+                    primary_phone_id = :p1,
+                    secondary_phone_id = :p2,
+                    intake_description = NULLIF(btrim(:d), ''),
+                    fault_description = NULLIF(btrim(:d), ''),
+                    updated_by = :u
+                WHERE id = :id
+                """
+            ),
+            {
+                "p1": p1,
+                "p2": p2,
+                "d": body.issue_description,
+                "u": actor,
+                "id": rid,
+            },
+        )
+
+        con.execute(
+            text(
+                """
+                UPDATE core.client_phones
+                SET is_primary = FALSE
+                WHERE client_id = :c
+                """
+            ),
+            {"c": row["client_id"]},
+        )
+
+        con.execute(
+            text(
+                """
+                INSERT INTO core.client_phones (
+                    client_id,
+                    phone_number_id,
+                    label,
+                    is_primary
+                )
+                VALUES (
+                    :c,
+                    :p,
+                    'Telefon 1',
+                    TRUE
+                )
+                ON CONFLICT (client_id, phone_number_id)
+                DO UPDATE SET is_primary = TRUE
+                """
+            ),
+            {
+                "c": row["client_id"],
+                "p": p1,
+            },
+        )
+
+        if p2:
+            con.execute(
+                text(
+                    """
+                    INSERT INTO core.client_phones (
+                        client_id,
+                        phone_number_id,
+                        label,
+                        is_primary
+                    )
+                    VALUES (
+                        :c,
+                        :p,
+                        'Telefon 2',
+                        FALSE
+                    )
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "c": row["client_id"],
+                    "p": p2,
+                },
+            )
+
+    return {"status": "ok"}
+
+
+@router.get("/{reception_id}/status-history")
+def status_history(
+    reception_id: str,
+    user: CurrentUser = Depends(require_staff),
+):
+    rid = _parse_uuid(reception_id, "ID przyjęcia")
+
+    with engine.connect() as con:
+        rows = con.execute(
+            text(
+                """
+                SELECT
+                    h.id,
+                    h.old_status,
+                    h.new_status,
+                    h.note,
+                    h.changed_at,
+                    u.display_name AS changed_by
+                FROM service.service_order_status_history h
+                LEFT JOIN core.app_users u
+                    ON u.id = h.changed_by
+                WHERE h.service_order_id = :id
+                ORDER BY h.changed_at DESC
+                """
+            ),
+            {"id": rid},
+        ).mappings().all()
+
+    return [
+        {
+            "id": str(r["id"]),
+            "old_status": str(r["old_status"]) if r["old_status"] else None,
+            "new_status": str(r["new_status"]),
+            "note": r["note"] or "",
+            "changed_at": r["changed_at"].isoformat(),
+            "changed_by": r["changed_by"] or "",
+        }
+        for r in rows
+    ]
+
+
+@router.post("/{reception_id}/ocr")
+def save_ocr_result(
+    reception_id: str,
+    body: OcrResultBody,
+    user: CurrentUser = Depends(require_staff),
+):
+    rid = _parse_uuid(reception_id, "ID przyjęcia")
+    mid = _parse_uuid(body.media_id, "ID zdjęcia")
+
+    with engine.begin() as con:
+        device_id = con.execute(
+            text(
+                """
+                SELECT device_id
+                FROM service.service_orders
+                WHERE id = :id
+                """
+            ),
+            {"id": rid},
+        ).scalar_one_or_none()
+
+        if device_id is None:
+            raise HTTPException(404, "Nie znaleziono przyjęcia.")
+
+        oid = con.execute(
+            text(
+                """
+                INSERT INTO service.ocr_runs (
+                    service_order_id,
+                    device_id,
+                    source_media_id,
+                    engine_name,
+                    engine_version,
+                    parser_version,
+                    raw_text,
+                    detected_manufacturer,
+                    detected_model,
+                    detected_serial_number,
+                    success,
+                    error_message,
+                    created_by
+                )
+                VALUES (
+                    :r,
+                    :d,
+                    :m,
+                    :en,
+                    NULLIF(:ev, ''),
+                    :pv,
+                    :raw,
+                    NULLIF(:man, ''),
+                    NULLIF(:model, ''),
+                    NULLIF(:serial, ''),
+                    :ok,
+                    NULLIF(:err, ''),
+                    :u
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "r": rid,
+                "d": device_id,
+                "m": mid,
+                "en": body.engine_name,
+                "ev": body.engine_version,
+                "pv": body.parser_version,
+                "raw": body.raw_text,
+                "man": body.detected_manufacturer,
+                "model": body.detected_model,
+                "serial": body.detected_serial_number,
+                "ok": body.success,
+                "err": body.error_message,
+                "u": uuid.UUID(user.id),
+            },
+        ).scalar_one()
+
+    return {"id": str(oid)}
